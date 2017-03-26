@@ -110,7 +110,7 @@ timeval string_to(std::string const& s)
       double i;
       double f = modf(v, &i);
       long sec = i;
-      if (sec == i)             // check for truncation
+      if (sec == i)             // check for overflow
       {
         long usec = f * 1e6;
         return{ sec, usec };
@@ -166,7 +166,7 @@ try
   for (int i = 1; i < 255; ++i)
   {
     std::string ipaddr = subnet + std::to_string(i);
-    futures.emplace_back(std::async(try_host, timeout,
+    futures.emplace_back(std::async(std::launch::async, try_host, timeout,
                                     std::move(ipaddr), port));
   }
   for (auto& f : futures)
