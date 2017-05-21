@@ -2,15 +2,17 @@
   For a given TCP port, try connecting to every IP address on the LAN and tell
   which ones succeed.  Attempts connections in parallel.
 
-  Arguments are: TIMEOUT SUBNET PORT.  TIMEOUT is seconds (floating point),
-  the maximum amount of time to wait for each connection.
+  Arguments are: TIMEOUT PORT SUBNETS...
+
+  TIMEOUT is seconds (floating point), the maximum amount of time to wait for
+  each connection.
 
   Examples:
 
     g++ -Wall -Werror -std=c++11 -s -O3 scanport.cpp -lpthread -o scanport
-    time ./scanport 0.5 10.60.3.0/24 80
+    time ./scanport 0.5 80 10.60.3.0/24
 
-    for i in $(seq 1 32); do scanport 0.5 10.60.$i.0/24 8090; done
+    scanport 0.5 8090 $(for i in $(seq 1 32); do echo 10.60.$i.0/24; done)
 */
 
 #include <iostream>
@@ -37,6 +39,8 @@
 namespace
 {
 
+bool debug;
+
 char const* program_name;
 
 std::string errStr()
@@ -51,9 +55,15 @@ std::string try_host(timeval timeout, std::string ipaddr, int port)
       // make sure this socket gets closed
       [&sockfd](void*) { close(sockfd); }
   };
-  sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  if (sockfd < 0)
-    throw std::runtime_error("socket: " + errStr());
+  for (;;)
+  {
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd >= 0)
+      break;
+    if (errno != EMFILE) // "Too many open files"
+      throw std::runtime_error("socket: " + errStr());
+    usleep(10000);
+  }
 
   sockaddr_in sa{};
   sa.sin_family = AF_INET;
@@ -65,21 +75,32 @@ std::string try_host(timeval timeout, std::string ipaddr, int port)
     throw std::runtime_error("fcntl: " + errStr());
 
   if (connect(sockfd, (sockaddr*) &sa, sizeof(sa)) == 0)
-    // connection succeeded immediately
+  {
+    if (debug)
+      std::clog << ipaddr + " - connected immediately\n";
     return ipaddr;
+  }
+  if (errno == EHOSTDOWN)
+  {
+    if (debug)
+      std::clog << ipaddr + " - host down\n";
+    return {};
+  }
   if (errno != EINPROGRESS)
-    throw std::runtime_error("connect: " + errStr());
+    throw std::runtime_error("connect " + ipaddr + ": " + errStr());
 
   fd_set fdset;
   FD_ZERO(&fdset);
   FD_SET(sockfd, &fdset);
-  timeval tv = timeout;
-  int r = select(sockfd + 1, nullptr, &fdset, nullptr, &tv);
+  int r = select(sockfd + 1, nullptr, &fdset, nullptr, &timeout);
   if (r == -1)
     throw std::runtime_error("select: " + errStr());
   if (r == 0)
-    // timeout
+  {
+    if (debug)
+      std::clog << ipaddr + " - timeout\n";
     return {};
+  }
 
   int err = 0;
   socklen_t len = sizeof(err);
@@ -87,9 +108,14 @@ std::string try_host(timeval timeout, std::string ipaddr, int port)
   if (r == -1)
     throw std::runtime_error("getsockopt: " + errStr());
   if (err != 0)
-    // not connected
+  {
+    if (debug)
+      std::clog << ipaddr + " - not connected\n";
     return {};
+  }
 
+  if (debug)
+    std::clog << ipaddr + " - connected, fd=" + std::to_string(sockfd) + "\n";
   return ipaddr;
 }
 
@@ -109,10 +135,10 @@ timeval string_to(std::string const& s)
     {
       double i;
       double f = modf(v, &i);
-      long sec = i;
+      decltype(timeval::tv_sec) sec = i;
       if (sec == i)             // check for overflow
       {
-        long usec = f * 1e6;
+        decltype(timeval::tv_usec) usec = f * 1e6;
         return{ sec, usec };
       }
     }
@@ -145,30 +171,43 @@ try
 {
   program_name = basename(argv[0]);
 
-  if (argc != 4)
+  if (argc > 1 && strcmp(argv[1], "--debug") == 0)
+  {
+    debug = true;
+    --argc, ++argv;
+  }
+
+  if (argc < 4)
     throw std::runtime_error("wrong usage");
   auto timeout = string_to<timeval>(*++argv);
-  std::string subnet{ *++argv };
   auto port = string_to<uint16_t>(*++argv);
+  argc -= 3;
 
-  // Currently supports only 24-bit IPv4 subnets, "x.x.x.0/24".
+  std::vector<std::string> subnets;
+  subnets.reserve(argc);
+  for (int i = 0; i < argc; ++i)
   {
-    std::regex subnet_re{R"(^(\d{1,3}\.\d{1,3}\.\d{1,3}\.)0/24$)"};
+    std::string subnet{ *++argv };
+
+    // Currently supports only 24-bit IPv4 subnets, "x.x.x.0/24".
+    std::regex subnet_re{R"(^(\d{1,3}\.\d{1,3}\.\d{1,3}\.)\d{1,3}/24$)"};
     std::smatch matched;
     if (not std::regex_match(subnet, matched, subnet_re))
       throw std::runtime_error("Invalid subnet '" + std::string(subnet) + '\'');
     assert(matched.size() == 2);
-    subnet = matched[1]; // e.g., "10.60.3."
+    subnets.emplace_back(matched[1]); // e.g., "10.60.3."
   }
 
   using Future = std::future<std::string>;
   std::vector<Future> futures;
-  for (int i = 1; i < 255; ++i)
-  {
-    std::string ipaddr = subnet + std::to_string(i);
-    futures.emplace_back(std::async(std::launch::async, try_host, timeout,
-                                    std::move(ipaddr), port));
-  }
+  for (auto& subnet : subnets)
+    for (int i = 1; i < 255; ++i)
+    {
+      std::string ipaddr = subnet + std::to_string(i);
+      futures.emplace_back(std::async(std::launch::async, try_host, timeout,
+                                      std::move(ipaddr), port));
+    }
+
   for (auto& f : futures)
   {
     auto ipaddr = f.get();
