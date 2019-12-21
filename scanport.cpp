@@ -13,6 +13,8 @@
     time ./scanport 0.5 80 10.60.3.0/24
 
     scanport 0.5 8090 $(for i in $(seq 1 32); do echo 10.60.$i.0/24; done)
+
+  Copyright (c) 2013, Michael Cook <michael@waxrat.com>. All rights reserved.
 */
 
 #include <iostream>
